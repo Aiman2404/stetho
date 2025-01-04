@@ -1,0 +1,288 @@
+import telebot
+import wave
+import pyaudio
+import numpy as np
+import librosa
+import os
+import keyboard
+import time
+from scipy.signal import butter, filtfilt
+from dtaidistance import dtw
+import threading
+
+# Telegram bot
+BOT_TOKEN = '7713328214:AAGEz2UjZNt5cNAOG81vMdPUDSjN38l7RgE'
+CHAT_ID = '1296801341'
+
+# Audio settings
+FORMAT = pyaudio.paInt16
+CHANNELS = 1
+RATE = 44100
+CHUNK = 1024
+REFERENCE_SOUNDS_DIR = "reference_sounds"
+
+if not os.path.exists(REFERENCE_SOUNDS_DIR):
+    os.makedirs(REFERENCE_SOUNDS_DIR)
+
+bot = telebot.TeleBot(BOT_TOKEN)
+
+def butter_bandpass(lowcut, highcut, fs, order=5):
+    """Create a bandpass filter"""
+    nyquist = 0.5 * fs
+    low = lowcut / nyquist
+    high = highcut / nyquist
+    b, a = butter(order, [low, high], btype='band')
+    return b, a
+
+def apply_bandpass_filter(data, fs, lowcut=20, highcut=400):
+    """Apply bandpass filter to the audio data"""
+    b, a = butter_bandpass(lowcut, highcut, fs)
+    return filtfilt(b, a, data)
+
+def play_audio(frames, output_device_index):
+    """Play audio in real-time"""
+    audio = pyaudio.PyAudio()
+    stream = audio.open(format=FORMAT, channels=CHANNELS,
+                        rate=RATE, output=True,
+                        output_device_index=output_device_index)
+    
+    for frame in frames:
+        stream.write(frame)
+    
+    stream.stop_stream()
+    stream.close()
+    audio.terminate()
+
+def record_audio_manual():
+    """Record audio with manual start/stop control and real-time playback"""
+    audio = pyaudio.PyAudio()
+    frames = []
+    is_recording = False
+    
+    def start_recording():
+        nonlocal is_recording
+        is_recording = True
+        print("\nRecording started... Press 'q' to stop recording")
+    
+    def stop_recording():
+        nonlocal is_recording
+        is_recording = False
+    
+    # Specify the input and output device indices
+    input_device_index = 1  # Change this to match your microphone's index
+    output_device_index = 2  # Change this to match your headset's index
+    
+    stream = audio.open(format=FORMAT, channels=CHANNELS,
+                       rate=RATE, input=True,
+                       frames_per_buffer=CHUNK,
+                       input_device_index=input_device_index)
+    
+    print("Press 's' to start recording")
+    keyboard.on_press_key('s', lambda _: start_recording())
+    keyboard.on_press_key('q', lambda _: stop_recording())
+    
+    while not is_recording:
+        time.sleep(0.1)
+    
+    # Start playback in a separate thread
+    playback_thread = threading.Thread(target=play_audio, args=(frames, output_device_index))
+    playback_thread.start()
+    
+    while is_recording:
+        try:
+            data = stream.read(CHUNK)
+            frames.append(data)
+        except KeyboardInterrupt:
+            break
+    
+    print("\nRecording finished")
+    stream.stop_stream()
+    stream.close()
+    audio.terminate()
+    
+    # Wait for playback to finish
+    playback_thread.join()
+    
+    return frames
+
+def save_audio(frames, filename):
+    """Save recorded audio to a file"""
+    audio = pyaudio.PyAudio()
+    with wave.open(filename, 'wb') as wf:
+        wf.setnchannels(CHANNELS)
+        wf.setsampwidth(audio.get_sample_size(FORMAT))
+        wf.setframerate(RATE)
+        wf.writeframes(b''.join(frames))
+    audio.terminate()
+    print(f"Audio saved as: {filename}")
+
+def extract_features(audio_path):
+    """
+    Extract features from an audio file.
+    """
+    try:
+        # Load the audio file
+        y, sr = librosa.load(audio_path, sr=None)
+        print(f"Loaded audio: {audio_path}, Duration: {len(y)/sr:.2f} seconds, Sample Rate: {sr} Hz")
+        
+        # Resample to a consistent sample rate (e.g., 22050 Hz)
+        target_sr = 22050
+        if sr != target_sr:
+            y = librosa.resample(y, orig_sr=sr, target_sr=target_sr)
+            sr = target_sr
+            print(f"Resampled to {sr} Hz")
+        
+        # Apply pre-emphasis to enhance high frequencies
+        y_filtered = librosa.effects.preemphasis(y)
+        print(f"Filtered audio shape: {y_filtered.shape}")
+        
+        # Extract MFCCs (Mel-frequency cepstral coefficients)
+        mfccs = librosa.feature.mfcc(y=y_filtered, sr=sr, n_mfcc=13)
+        print(f"MFCCs shape: {mfccs.shape}")
+        
+        # Extract Chroma features
+        chroma = librosa.feature.chroma_stft(y=y_filtered, sr=sr)
+        print(f"Chroma shape: {chroma.shape}")
+        
+        # Extract Spectral Contrast
+        spectral_contrast = librosa.feature.spectral_contrast(y=y_filtered, sr=sr)
+        print(f"Spectral Contrast shape: {spectral_contrast.shape}")
+        
+        # Combine features into a single feature vector
+        features = np.vstack([mfccs, chroma, spectral_contrast])
+        print(f"Combined features shape: {features.shape}")
+        
+        # Normalize features
+        features_mean = np.mean(features, axis=1, keepdims=True)
+        features_std = np.std(features, axis=1, keepdims=True)
+        normalized_features = (features - features_mean) / (features_std + 1e-10)  # Avoid division by zero
+        print(f"Normalized features shape: {normalized_features.shape}")
+        
+        return normalized_features
+    
+    except Exception as e:
+        print(f"Error in extract_features: {str(e)}")
+        return None
+
+def compare_sounds(file1, file2):
+    """
+    Compare two audio files using Dynamic Time Warping (DTW).
+    """
+    try:
+        # Extract features for both files
+        features1 = extract_features(file1)
+        features2 = extract_features(file2)
+        
+        if features1 is None or features2 is None:
+            print("Feature extraction failed. Skipping comparison.")
+            return 0.0
+        
+        # Ensure features have the same number of frames
+        min_frames = min(features1.shape[1], features2.shape[1])
+        features1 = features1[:, :min_frames]
+        features2 = features2[:, :min_frames]
+        print(f"Features after trimming: {features1.shape}, {features2.shape}")
+        
+        # Flatten the features for DTW
+        features1_flat = features1.flatten()
+        features2_flat = features2.flatten()
+        
+        # Check if feature vectors are valid
+        if len(features1_flat) == 0 or len(features2_flat) == 0:
+            print("Error: Feature vectors are empty.")
+            return 0.0
+        
+        # Calculate DTW distance
+        print("Calculating DTW distance...")
+        distance = dtw.distance(features1_flat, features2_flat, window=100)  # Use a window to speed up DTW
+        print(f"DTW Distance: {distance}")
+        
+        # Convert distance to similarity (lower distance = higher similarity)
+        max_distance = 1000  # Adjust based on your data
+        similarity = max(0, 100 - (distance / max_distance) * 100)
+        print(f"Similarity: {similarity:.2f}%")
+        
+        return similarity
+    
+    except Exception as e:
+        print(f"Error in compare_sounds: {str(e)}")
+        return 0.0
+
+def analyze_recording(audio_file):
+    """Analyze recording against all reference sounds"""
+    results = []
+    
+    for reference_file in os.listdir(REFERENCE_SOUNDS_DIR):
+        if reference_file.endswith('.wav'):
+            reference_path = os.path.join(REFERENCE_SOUNDS_DIR, reference_file)
+            similarity = compare_sounds(audio_file, reference_path)
+            if similarity > 0:  # Only include valid comparisons
+                results.append((reference_file, similarity))
+    
+    results.sort(key=lambda x: x[1], reverse=True)
+    return results
+
+def send_to_telegram(audio_file, analysis_results):
+    """Send audio and analysis results to Telegram"""
+    try:
+        with open(audio_file, 'rb') as audio:
+            bot.send_audio(CHAT_ID, audio)
+        
+        if analysis_results:
+            message = "Analysis Results:\n\n"
+            for reference_file, similarity in analysis_results:
+                message += f"{reference_file}: {similarity:.2f}% match\n"
+            bot.send_message(CHAT_ID, message)
+            
+    except Exception as e:
+        print(f"Error sending to Telegram: {str(e)}")
+
+def main_menu():
+    while True:
+        print("\n=== Heart Sound Analysis Tool ===")
+        print("1. Record new audio")
+        print("2. Analyze last recording")
+        print("3. Send to Telegram")
+        print("4. Exit")
+        
+        choice = input("\nEnter your choice (1-4): ")
+        
+        if choice == '1':
+            print("\nStarting new recording session...")
+            frames = record_audio_manual()
+            
+            if frames:
+                filename = input("\nEnter filename to save (e.g., heart_sound.wav): ")
+                if not filename.endswith('.wav'):
+                    filename += '.wav'
+                save_audio(frames, filename)
+        
+        elif choice == '2':
+            filename = input("Enter the filename to analyze: ")
+            if os.path.exists(filename):
+                results = analyze_recording(filename)
+                
+                print("\nAnalysis Results:")
+                for reference_file, similarity in results:
+                    print(f"{reference_file}: {similarity:.2f}% match")
+            else:
+                print("File not found!")
+        
+        elif choice == '3':
+            filename = input("Enter the filename to send: ")
+            if os.path.exists(filename):
+                results = analyze_recording(filename)
+                send_to_telegram(filename, results)
+                print("Sent to Telegram!")
+            else:
+                print("File not found!")
+        
+        elif choice == '4':
+            print("Goodbye!")
+            break
+        
+        else:
+            print("Invalid choice! Please try again.")
+
+if __name__ == "__main__":
+    main_menu()
